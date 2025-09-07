@@ -1,131 +1,103 @@
-resource "helm_release" "karpenter" {
-  namespace        = "karpenter"
-  create_namespace = true
+resource "null_resource" "install_karpenter" {
+  triggers = {
+    cluster_name = var.cluster_name
+  }
 
-  name       = "karpenter"
-  repository = "https://charts.karpenter.sh"
-  chart      = "karpenter"
-  version    = var.karpenter_version
-
-  values = [
-    <<-EOT
-    serviceAccount:
-      annotations:
-        eks.amazonaws.com/role-arn: ${var.karpenter_controller_iam_arn}
-    
-    settings:
-      clusterName: ${var.cluster_name}
-      clusterEndpoint: ${var.cluster_endpoint}
-      interruptionQueue: ${var.cluster_name}
-    
-    controller:
-      defaultInstanceProfile: ${var.node_instance_profile}
+  provisioner "local-exec" {
+    command = <<-EOT
+      # 添加 helm repo
+      helm repo add karpenter https://charts.karpenter.sh
+      helm repo update
+      
+      # 创建 namespace
+      kubectl create namespace karpenter --dry-run=client -o yaml | kubectl apply -f -
+      
+      # 安装 karpenter
+      helm upgrade --install karpenter karpenter/karpenter \
+        --namespace karpenter \
+        --version ${var.karpenter_version} \
+        --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=${var.karpenter_controller_iam_arn} \
+        --set settings.clusterName=${var.cluster_name} \
+        --set settings.clusterEndpoint=${var.cluster_endpoint} \
+        --set controller.defaultInstanceProfile=${var.node_instance_profile}
     EOT
-  ]
+  }
 
-  depends_on = [kubernetes_namespace.karpenter]
-}
-
-resource "kubernetes_namespace" "karpenter" {
-  metadata {
-    name = "karpenter"
+  provisioner "local-exec" {
+    when    = destroy
+    command = <<-EOT
+      helm uninstall karpenter --namespace karpenter || true
+      kubectl delete namespace karpenter --ignore-not-found=true
+    EOT
   }
 }
 
-resource "kubectl_manifest" "karpenter_provisioner" {
-  yaml_body = <<-YAML
-apiVersion: karpenter.sh/v1alpha5
-kind: Provisioner
-metadata:
-  name: default
-spec:
-  requirements:
-    - key: kubernetes.io/arch
-      operator: In
-      values: ["amd64"]
-    - key: kubernetes.io/os
-      operator: In
-      values: ["linux"]
-    - key: karpenter.sh/capacity-type
-      operator: In
-      values: ["on-demand"]
-    - key: node.kubernetes.io/instance-type
-      operator: In
-      values: ["t3.micro"]
-  providerRef:
-    name: default
-  ttlSecondsAfterEmpty: 30
-  limits:
-    resources:
-      cpu: 1000
-  YAML
+resource "null_resource" "karpenter_provisioner" {
+  depends_on = [null_resource.install_karpenter]
 
-  depends_on = [helm_release.karpenter]
+  provisioner "local-exec" {
+    command = <<-EOT
+      kubectl apply -f - <<EOF
+      apiVersion: karpenter.sh/v1alpha5
+      kind: Provisioner
+      metadata:
+        name: default
+      spec:
+        requirements:
+          - key: kubernetes.io/arch
+            operator: In
+            values: ["amd64"]
+          - key: kubernetes.io/os
+            operator: In
+            values: ["linux"]
+          - key: karpenter.sh/capacity-type
+            operator: In
+            values: ["on-demand"]
+          - key: node.kubernetes.io/instance-type
+            operator: In
+            values: ["t3.micro"]
+        providerRef:
+          name: default
+        ttlSecondsAfterEmpty: 30
+        limits:
+          resources:
+            cpu: 1000
+      EOF
+    EOT
+  }
 }
 
-resource "kubectl_manifest" "karpenter_aws_node_template" {
-  yaml_body = <<-YAML
-apiVersion: karpenter.k8s.aws/v1alpha1
-kind: AWSNodeTemplate
-metadata:
-  name: default
-spec:
-  subnetSelector:
-    karpenter.sh/discovery: ${var.cluster_name}
-  securityGroupSelector:
-    karpenter.sh/discovery: ${var.cluster_name}
-  blockDeviceMappings:
-    - deviceName: /dev/xvda
-      ebs:
-        volumeSize: 20Gi
-        volumeType: gp3
-        deleteOnTermination: true
-  amiFamily: Ubuntu
-  instanceTypes: ["t3.micro"]
-  userData: |
-    #!/bin/bash
-    set -ex
-    apt-get update
-    apt-get install -y docker.io
-    systemctl enable docker
-    systemctl start docker
-  YAML
+resource "null_resource" "karpenter_node_template" {
+  depends_on = [null_resource.install_karpenter]
 
-  depends_on = [helm_release.karpenter]
-}
-
-# Create initial nodes using Karpenter provisioner
-resource "kubectl_manifest" "initial_nodes" {
-  count = var.node_count
-
-  yaml_body = <<-YAML
-apiVersion: karpenter.sh/v1alpha5
-kind: NodeClaim
-metadata:
-  name: initial-node-${count.index}
-  labels:
-    app: initial-node
-spec:
-  requirements:
-    - key: kubernetes.io/arch
-      operator: In
-      values: ["amd64"]
-    - key: kubernetes.io/os
-      operator: In
-      values: ["linux"]
-    - key: node.kubernetes.io/instance-type
-      operator: In
-      values: ["t3.micro"]
-  nodeClassRef:
-    apiGroup: karpenter.k8s.aws
-    kind: AWSNodeTemplate
-    name: default
-  ttlSecondsAfterEmpty: 86400
-  YAML
-
-  depends_on = [
-    helm_release.karpenter,
-    kubectl_manifest.karpenter_provisioner,
-    kubectl_manifest.karpenter_aws_node_template
-  ]
+  provisioner "local-exec" {
+    command = <<-EOT
+      kubectl apply -f - <<EOF
+      apiVersion: karpenter.k8s.aws/v1alpha1
+      kind: AWSNodeTemplate
+      metadata:
+        name: default
+      spec:
+        subnetSelector:
+          karpenter.sh/discovery: ${var.cluster_name}
+        securityGroupSelector:
+          karpenter.sh/discovery: ${var.cluster_name}
+        blockDeviceMappings:
+          - deviceName: /dev/xvda
+            ebs:
+              volumeSize: 20Gi
+              volumeType: gp3
+              deleteOnTermination: true
+        amiFamily: Ubuntu
+        instanceTypes: ["t3.micro"]
+        userData: |
+          #!/bin/bash
+          set -ex
+          apt-get update
+          apt-get install -y docker.io
+          systemctl enable docker
+          systemctl start docker
+      EOF
+    EOT
+  }
 }
