@@ -1,10 +1,6 @@
 name: Terraform EKS with Karpenter
 
 on:
-  push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
   workflow_dispatch:
     inputs:
       environment:
@@ -18,15 +14,20 @@ on:
         required: true
         options: [apply, destroy]
         default: apply
+      stage:
+        type: choice
+        description: Deployment stage
+        required: true
+        options: [eks-iam, karpenter, full]
+        default: full
 
 env:
-  AWS_REGION: us-west-2
   TF_VERSION: 1.6.0
 
 jobs:
   terraform:
     runs-on: ubuntu-latest
-    environment: ${{ github.event.inputs.environment || 'dev' }}
+    environment: ${{ github.event.inputs.environment }}
 
     steps:
     - name: Checkout code
@@ -42,27 +43,64 @@ jobs:
       with:
         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ env.AWS_REGION }}
+        aws-region: us-east-1
 
     - name: Terraform Init
       run: terraform init
 
     - name: Terraform Select Workspace
       run: |
-        terraform workspace select ${{ github.event.inputs.environment || 'dev' }} || \
-        terraform workspace new ${{ github.event.inputs.environment || 'dev' }}
+        terraform workspace select ${{ github.event.inputs.environment }} || \
+        terraform workspace new ${{ github.event.inputs.environment }}
 
     - name: Terraform Validate
       run: terraform validate
 
-    - name: Terraform Plan
-      if: github.event.inputs.action == 'apply'
-      run: terraform plan -var-file="environments/${{ github.event.inputs.environment || 'dev' }}.tfvars"
+    - name: Deploy EKS and IAM
+      if: github.event.inputs.action == 'apply' && (github.event.inputs.stage == 'eks-iam' || github.event.inputs.stage == 'full')
+      run: |
+        terraform apply -auto-approve \
+          -target=module.eks \
+          -target=module.iam \
+          -var-file="environments/${{ github.event.inputs.environment }}.tfvars"
 
-    - name: Terraform Apply
-      if: github.event.inputs.action == 'apply'
-      run: terraform apply -auto-approve -var-file="environments/${{ github.event.inputs.environment || 'dev' }}.tfvars"
+    - name: Wait for EKS Cluster
+      if: github.event.inputs.action == 'apply' && github.event.inputs.stage == 'full'
+      run: |
+        CLUSTER_NAME=$(terraform output -raw cluster_name)
+        echo "Waiting for cluster $CLUSTER_NAME to become active..."
+        for i in {1..30}; do
+          STATUS=$(aws eks describe-cluster --name $CLUSTER_NAME --query 'cluster.status' --output text 2>/dev/null || echo "CREATING")
+          if [ "$STATUS" = "ACTIVE" ]; then
+            echo "Cluster is ACTIVE"
+            break
+          fi
+          echo "Cluster status: $STATUS (attempt $i/30)"
+          sleep 30
+        done
+        if [ "$STATUS" != "ACTIVE" ]; then
+          echo "Cluster did not become active in time"
+          exit 1
+        fi
 
-    - name: Terraform Destroy
-      if: github.event.inputs.action == 'destroy'
-      run: terraform destroy -auto-approve -var-file="environments/${{ github.event.inputs.environment || 'dev' }}.tfvars"
+    - name: Deploy Karpenter
+      if: github.event.inputs.action == 'apply' && (github.event.inputs.stage == 'karpenter' || github.event.inputs.stage == 'full')
+      run: |
+        terraform apply -auto-approve \
+          -target=module.karpenter \
+          -var-file="environments/${{ github.event.inputs.environment }}.tfvars"
+
+    - name: Destroy Karpenter
+      if: github.event.inputs.action == 'destroy' && (github.event.inputs.stage == 'karpenter' || github.event.inputs.stage == 'full')
+      run: |
+        terraform destroy -auto-approve \
+          -target=module.karpenter \
+          -var-file="environments/${{ github.event.inputs.environment }}.tfvars"
+
+    - name: Destroy EKS and IAM
+      if: github.event.inputs.action == 'destroy' && (github.event.inputs.stage == 'eks-iam' || github.event.inputs.stage == 'full')
+      run: |
+        terraform destroy -auto-approve \
+          -target=module.eks \
+          -target=module.iam \
+          -var-file="environments/${{ github.event.inputs.environment }}.tfvars"
