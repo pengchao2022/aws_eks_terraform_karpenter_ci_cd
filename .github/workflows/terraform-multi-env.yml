@@ -1,0 +1,68 @@
+name: Terraform EKS with Karpenter
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      environment:
+        type: choice
+        description: Environment to deploy
+        required: true
+        options: [dev, staging, prod]
+      action:
+        type: choice
+        description: Terraform action
+        required: true
+        options: [apply, destroy]
+        default: apply
+
+env:
+  AWS_REGION: us-west-2
+  TF_VERSION: 1.6.0
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v2
+      with:
+        terraform_version: ${{ env.TF_VERSION }}
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Terraform Init
+      run: terraform init
+
+    - name: Terraform Select Workspace
+      run: |
+        terraform workspace select ${{ github.event.inputs.environment || 'dev' }} || \
+        terraform workspace new ${{ github.event.inputs.environment || 'dev' }}
+
+    - name: Terraform Validate
+      run: terraform validate
+
+    - name: Terraform Plan
+      if: github.event.inputs.action == 'apply'
+      run: terraform plan -var-file="environments/${{ github.event.inputs.environment || 'dev' }}.tfvars"
+
+    - name: Terraform Apply
+      if: github.event.inputs.action == 'apply'
+      run: terraform apply -auto-approve -var-file="environments/${{ github.event.inputs.environment || 'dev' }}.tfvars"
+
+    - name: Terraform Destroy
+      if: github.event.inputs.action == 'destroy'
+      run: terraform destroy -auto-approve -var-file="environments/${{ github.event.inputs.environment || 'dev' }}.tfvars"
