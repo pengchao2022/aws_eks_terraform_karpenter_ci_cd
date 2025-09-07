@@ -12,8 +12,8 @@ on:
         type: choice
         description: Terraform action
         required: true
-        options: [apply, destroy]
-        default: apply
+        options: [plan, apply, destroy]
+        default: plan
       stage:
         type: choice
         description: Deployment stage
@@ -56,6 +56,42 @@ jobs:
     - name: Terraform Validate
       run: terraform validate
 
+    - name: Determine deployment targets
+      id: targets
+      run: |
+        if [ "${{ github.event.inputs.stage }}" = "eks-iam" ]; then
+          echo "TARGETS=-target=module.eks -target=module.iam" >> $GITHUB_OUTPUT
+        elif [ "${{ github.event.inputs.stage }}" = "karpenter" ]; then
+          echo "TARGETS=-target=module.karpenter" >> $GITHUB_OUTPUT
+        else
+          echo "TARGETS=" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Terraform Plan
+      if: github.event.inputs.action == 'plan'
+      run: |
+        if [ -n "${{ steps.targets.outputs.TARGETS }}" ]; then
+          terraform plan ${{ steps.targets.outputs.TARGETS }} \
+            -var-file="environments/${{ github.event.inputs.environment }}.tfvars" \
+            -out=tfplan
+        else
+          terraform plan \
+            -var-file="environments/${{ github.event.inputs.environment }}.tfvars" \
+            -out=tfplan
+        fi
+        
+        # 保存 plan 输出供后续步骤使用
+        terraform show -no-color tfplan > plan_output.txt
+
+    - name: Upload Terraform Plan
+      if: github.event.inputs.action == 'plan'
+      uses: actions/upload-artifact@v4
+      with:
+        name: terraform-plan-${{ github.event.inputs.environment }}-${{ github.event.inputs.stage }}
+        path: |
+          tfplan
+          plan_output.txt
+
     - name: Deploy EKS and IAM
       if: github.event.inputs.action == 'apply' && (github.event.inputs.stage == 'eks-iam' || github.event.inputs.stage == 'full')
       run: |
@@ -90,6 +126,16 @@ jobs:
           -target=module.karpenter \
           -var-file="environments/${{ github.event.inputs.environment }}.tfvars"
 
+    - name: Apply from Plan
+      if: github.event.inputs.action == 'apply' && github.event.inputs.stage == 'full'
+      run: |
+        # 如果有 plan 文件，使用它来 apply
+        if [ -f "tfplan" ]; then
+          terraform apply -auto-approve tfplan
+        else
+          terraform apply -auto-approve -var-file="environments/${{ github.event.inputs.environment }}.tfvars"
+        fi
+
     - name: Destroy Karpenter
       if: github.event.inputs.action == 'destroy' && (github.event.inputs.stage == 'karpenter' || github.event.inputs.stage == 'full')
       run: |
@@ -104,3 +150,26 @@ jobs:
           -target=module.eks \
           -target=module.iam \
           -var-file="environments/${{ github.event.inputs.environment }}.tfvars"
+
+    - name: Plan Destroy
+      if: github.event.inputs.action == 'plan' && github.event.inputs.stage == 'full'
+      run: |
+        terraform plan -destroy \
+          -var-file="environments/${{ github.event.inputs.environment }}.tfvars" \
+          -out=tfdestroyplan
+        
+        terraform show -no-color tfdestroyplan > destroy_plan_output.txt
+
+    - name: Upload Destroy Plan
+      if: github.event.inputs.action == 'plan' && github.event.inputs.stage == 'full'
+      uses: actions/upload-artifact@v4
+      with:
+        name: terraform-destroy-plan-${{ github.event.inputs.environment }}
+        path: |
+          tfdestroyplan
+          destroy_plan_output.txt
+
+    - name: Complete Terraform Destroy
+      if: github.event.inputs.action == 'destroy' && github.event.inputs.stage == 'full'
+      run: |
+        terraform destroy -auto-approve -var-file="environments/${{ github.event.inputs.environment }}.tfvars"
